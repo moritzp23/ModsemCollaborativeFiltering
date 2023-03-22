@@ -545,6 +545,8 @@ class EDLAE(NumpyRecommender):
 class MRFApprox(NumpyRecommender):
     """
     No mean removal and different regularization.
+    
+    Based on the code from: https://github.com/hasteck/MRF_NeurIPS_2019
     """
     def __init__(self, lmbda):
         self.lmbda = lmbda
@@ -901,7 +903,7 @@ class ADMM_slim(NumpyRecommender):
     
 class ADMM_EDLAE(NumpyRecommender):
     """
-    Compared to the normal SLIM model, this just uses the slightly different regularization term of the EDLAE model. (better results)
+    Compared to the normal SLIM model, this just uses the slightly different regularization term of the EDLAE model. (better results).
     """
     def __init__(self, lambda1, lambda2, p, rho=10000, t=10, tau=2, force_nonneg=False, eps_rel=1e-3, eps_abs=1e-3):
         self.lambda1 = lambda1
