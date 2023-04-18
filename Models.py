@@ -2,10 +2,11 @@ import time
 import numpy as np
 import pandas as pd
 from metrics import * 
-from scipy.sparse import csr_matrix, diags, csc_matrix, find
+from scipy.sparse import csr_matrix, diags, csc_matrix, coo_matrix, find, identity, spdiags
 from scipy.linalg import lu_factor, lu_solve, cholesky
 from scipy.linalg.lapack import spotri, dpotri
 
+from sparse_dot_topn import awesome_cossim_topn
 import os
 from bottleneck import argpartition
 from copy import deepcopy
@@ -57,14 +58,14 @@ def sparsity_pattern_cov(XtX, n_users, alpha, threshold, max_in_col):
     mu = XtX_diag / n_users
     variance_times_usercount = XtX_diag - mu * mu * n_users
 
-    # we dont want to keep the diagonal
-    XtX[idx_diag] = 0.
-
     # standardizing the data-matrix XtX (if alpha=1, then XtX becomes the correlation matrix)
     XtX -= mu[:,None] * (mu * n_users)
     rescaling = np.power(variance_times_usercount, alpha / 2.0) 
     scaling = 1.0  / rescaling
     XtX = scaling[:,None] * XtX * scaling
+    
+    # we dont want to keep the diagonal
+    XtX[idx_diag] = 0.
 
     # apply threshold
     idx = np.where( np.abs(XtX) > threshold)
@@ -321,13 +322,14 @@ class ItemKNN(NumpyRecommender):
     
         if self.enable_average_bias:
             # subtracting the mean will result in the matricies not being sparse anymore
-            X_dense = self.X_test.toarray()
-            item_mean = self.X_train.mean(axis=0).A1
-            pred = np.dot(X_dense - item_mean, self.sim_mat.toarray().T) + item_mean
+            item_mean = self.X_train.mean(axis=0).A1.reshape(1,-1)
+            pred = np.dot(
+                self.X_test, self.sim_mat.T).toarray() - np.dot(csr_matrix(item_mean), 
+                self.sim_mat.T - spdiags(data=np.ones(self.nItems, dtype=np.float32), diags=0, m=self.nItems, n=self.nItems, format='csr')
+                ).toarray() 
             
             # we dont want to predict items that the user already interacted with 
             pred[X_rowidx, X_colidx] = -np.inf
-            del X_dense
             
         else:
             pred = np.dot(self.X_test, self.sim_mat.T).toarray()
@@ -345,7 +347,92 @@ class ItemKNN(NumpyRecommender):
         return self.topk
                 
     
+class EASE(NumpyRecommender):
+    """
+    EASE
+    """
+    
+    def __init__(self, lmbda):
+        self.lmbda = lmbda
         
+        
+    def _upper_triangular_to_symmetric(self, upper_triang):
+        upper_triang += np.triu(upper_triang, k=1).T
+
+
+    def _faster_spd_inverse(self, matrix, dtype=np.float32):
+        start = time.time()
+        if matrix.dtype != dtype:
+            raise ValueError('Supplied dtype doesnt match matrix dtype')
+            
+        cholesky_decomp = cholesky(matrix)
+        print(f'Cholesky: {time.time() - start}')
+        start = time.time()
+        
+        if dtype == np.float32:
+            inv, info = spotri(cholesky_decomp)
+        elif dtype == np.float64:
+            inv, info = dpotri(cholesky_decomp) 
+            
+        else:
+            raise ValueError(f'Unsupported dtype: {dtype}')
+            
+        if info != 0:
+            raise ValueError('spotri failed on input')
+        self._upper_triangular_to_symmetric(inv)
+        print(f'Computing Inverse based on Chol: {time.time() - start}')
+        return inv
+
+        
+    def fit(self, train_data: pd.DataFrame, uid_str: str, sid_str: str, nItems: int, store_G_inv=False):    
+        if not set([uid_str, sid_str]) <= set(train_data.columns):
+            raise ValueError(f'{uid_str} or {sid_str} not present in test_data columns')
+        start = time.time()
+        self.nItems = nItems
+        self.X_train = self._parse_data(train_data, uid_str, sid_str)
+        
+        # calculate the closed-form solution to the optimization problem
+        G = np.dot(self.X_train.T, self.X_train).toarray()
+        G_diag = np.diag(G) # vector with diagonal entries of G
+        np.fill_diagonal(G, G_diag + self.lmbda)
+        
+        if store_G_inv:
+            self.G_inv = G
+        
+        print(f'Until Inverse computation: {time.time() - start}')
+        G = self._faster_spd_inverse(G) 
+        start = time.time()
+        print('finished inverse computation')
+        self.B = G / (-np.diag(G))
+        np.fill_diagonal(self.B, val=0.)
+        print(f'After Inverse computation: {time.time() - start}')
+        
+            
+    
+    def predict(self, data: pd.DataFrame, uid_str: str, sid_str: str, 
+                k: int, return_scores: bool = False):
+        if not set([uid_str, sid_str]) <= set(data.columns):
+            raise ValueError(f'{uid_str} or {sid_str} not present in data columns')
+               
+        self.k = k
+        self.X_test = self._parse_data(data, uid_str, sid_str)
+        X_rowidx, X_colidx, _ = find(self.X_test)
+        
+        X_test_dense = self.X_test.toarray()
+        pred = np.dot(X_test_dense, self.B) 
+        del X_test_dense 
+            
+        # we dont want to predict items that the user already interacted with 
+        pred[X_rowidx, X_colidx] = -np.inf
+        
+        # top k items most popular items for each user
+        self.topk = argpartition(-pred, self.k - 1, axis=1)[:, :self.k]
+        
+        # we need to sort manually
+        n_test = self.X_test.shape[0]
+        sorted_idx = (-pred)[np.arange(n_test)[:, None], self.topk].argsort()
+        self.topk = self.topk[np.arange(n_test)[:, None], sorted_idx]
+        return self.topk        
 
         
         
@@ -388,7 +475,7 @@ class DLAE(NumpyRecommender):
     def fit(self, train_data: pd.DataFrame, uid_str: str, sid_str: str, nItems: int):    
         if not set([uid_str, sid_str]) <= set(train_data.columns):
             raise ValueError(f'{uid_str} or {sid_str} not present in test_data columns')
-
+        start = time.time()    
         self.nItems = nItems
         self.X_train = self._parse_data(train_data, uid_str, sid_str)
         
@@ -399,19 +486,28 @@ class DLAE(NumpyRecommender):
         if self.method == 'lu':
             lambda_mat_inv_diag = 1 / (self.p / (1 - self.p) * G_diag + self.lmbda)
             A = np.multiply(G, lambda_mat_inv_diag[None,:]) + np.eye(self.nItems)
+            print(f'Until Decomp computation: {time.time() - start}')
+            start = time.time()  
             self.lu, self.piv = lu_factor(A)
+            print(f'LU computation: {time.time() - start}')
             
-        
+
         elif self.method == 'chol':
             lambda_mat_diag = self.p / (1 - self.p) * G_diag + self.lmbda
-            L = cholesky(G + np.diag(lambda_mat_diag), lower=True)
+            np.fill_diagonal(G, G_diag + lambda_mat_diag)
+            print(f'Until Decomp computation: {time.time() - start}')
+            start = time.time() 
+            L = cholesky(G, lower=True)
+            print(f'Chol computation: {time.time() - start}')
+            start = time.time() 
             diag_L = np.diag(L)
             self.lu = L / diag_L + diag_L[:, None] * L.T / lambda_mat_diag[None, :] #np.tril(L / np.diag(L), k=-1)
             self.lu[np.diag_indices(self.nItems)] -= 1
+            print(f'Computing factor based on chol: {time.time() - start}')
             
             del L
             self.piv = np.arange(self.nItems)
-        
+
             
         elif self.method == 'inv':
             # compute the inverse directly (i.e the model matrix)
@@ -475,10 +571,14 @@ class EDLAE(NumpyRecommender):
 
 
     def _faster_spd_inverse(self, matrix, dtype=np.float32):
+        start = time.time()
         if matrix.dtype != dtype:
             raise ValueError('Supplied dtype doesnt match matrix dtype')
             
         cholesky_decomp = cholesky(matrix)
+        print(f'Cholesky: {time.time() - start}')
+        start = time.time()
+        
         if dtype == np.float32:
             inv, info = spotri(cholesky_decomp)
         elif dtype == np.float64:
@@ -490,29 +590,32 @@ class EDLAE(NumpyRecommender):
         if info != 0:
             raise ValueError('spotri failed on input')
         self._upper_triangular_to_symmetric(inv)
+        print(f'Computing Inverse based on Chol: {time.time() - start}')
         return inv
 
         
     def fit(self, train_data: pd.DataFrame, uid_str: str, sid_str: str, nItems: int, store_G_inv=False):    
         if not set([uid_str, sid_str]) <= set(train_data.columns):
             raise ValueError(f'{uid_str} or {sid_str} not present in test_data columns')
-
+        start = time.time()
         self.nItems = nItems
         self.X_train = self._parse_data(train_data, uid_str, sid_str)
         
         # calculate the closed-form solution to the optimization problem
         G = np.dot(self.X_train.T, self.X_train).toarray()
         G_diag = np.diag(G) # vector with diagonal entries of G
-        np.fill_diagonal(G, G_diag + self.p / (1 - self.p) * G_diag + self.lmbda)
+        np.fill_diagonal(G, (1 + self.p / (1 - self.p)) * G_diag + self.lmbda)
         
         if store_G_inv:
             self.G_inv = G
-            
+        
+        print(f'Until Inverse computation: {time.time() - start}')
         G = self._faster_spd_inverse(G) 
+        start = time.time()
         print('finished inverse computation')
         self.B = G / (-np.diag(G))
         np.fill_diagonal(self.B, val=0.)
-        
+        print(f'After Inverse computation: {time.time() - start}')
             
     
     def predict(self, data: pd.DataFrame, uid_str: str, sid_str: str, 
@@ -567,7 +670,6 @@ class MRFApprox(NumpyRecommender):
         scaling = 1.0  / rescaling
         XtX = scaling[:,None].astype(np.float32) * XtX * scaling.astype(np.float32)
 
-
         # apply threshold
         idx = np.where( np.abs(XtX) > threshold)
         A = csc_matrix( (XtX[idx], idx), shape=XtX.shape, dtype=np.float32)
@@ -603,7 +705,6 @@ class MRFApprox(NumpyRecommender):
         
         # try the other sparsity pattern
         A, XtX, scaling, rescaling = self._calculate_sparsity_pattern(XtX=deepcopy(XtX), alpha=self.alpha, threshold=self.threshold, max_in_col=self.max_in_col)
-        print(XtX.dtype)
         return A
     
     def _upper_triangular_to_symmetric(self, upper_triang):
@@ -627,10 +728,10 @@ class MRFApprox(NumpyRecommender):
             raise ValueError('spotri failed on input')
         self._upper_triangular_to_symmetric(inv)
         return inv
-
-
+    
+    
         
-    def fit(self, train_data: pd.DataFrame, uid_str: str, sid_str: str, nItems: int, 
+    def fit_old(self, train_data: pd.DataFrame, uid_str: str, sid_str: str, nItems: int, 
             alpha, threshold, max_in_col, r, dtype=np.float32, store_dense = False):    
         if not set([uid_str, sid_str]) <= set(train_data.columns):
             raise ValueError(f'{uid_str} or {sid_str} not present in test_data columns')
@@ -646,13 +747,20 @@ class MRFApprox(NumpyRecommender):
         self.r = r
         self.max_in_col = max_in_col
         
+        start = time.time()
         XtX = np.dot(self.X_train.T, self.X_train).toarray()
-
+        end = time.time()
+        print(f'XtX: {(end-start)} sec')
+        
+        start = time.time()
         A, XtX, scaling, rescaling = self._calculate_sparsity_pattern(XtX=deepcopy(XtX), alpha=self.alpha, threshold=self.threshold, max_in_col=self.max_in_col)
         
         idx_diag = np.diag_indices(XtX.shape[0])
         XtX[idx_diag] += self.lmbda 
+        end = time.time()
+        print(f'Get A: {(end-start)} sec')        
         
+        start = time.time()
         # list L in the paper, sorted by item-counts per column, ties broken by item-popularities as reflected by np.diag(XtX)
         A_col_count = A.getnnz(axis=0)
         L = np.argsort(A_col_count + np.diag(XtX) / 2.0/ np.max(np.diag(XtX)))[::-1]  
@@ -669,13 +777,17 @@ class MRFApprox(NumpyRecommender):
                 # remove possibly several items from list L, as determined by parameter r  
                 d_count = max(1, int(np.ceil(len(n_i) * self.r)))
                 d = n_i[:d_count] # set D, see step 2 in the paper
-                todo_indicators[d] = 0  # step 4 in the paper        
+                todo_indicators[d] = 0  # step 4 in the paper       
+                
+        end = time.time()
+        print(f'building block_list: {(end-start)} sec')
 
         print("now step 3 in section 3.2 of the paper: iterating ...")
         # now the (possibly heavy) computations of step 3:
         # given that steps 1,2,4 are already done, the following for-loop could be implemented in parallel.   
 
         B_rowidx, B_colidx, B_val = [], [], []
+        start = time.time()
         
         for n_i in block_list:
             #calculate dense solution for the items in set n
@@ -697,8 +809,12 @@ class MRFApprox(NumpyRecommender):
             B_colidx.extend(block_idx[0].flatten().tolist())
             B_val.extend(B_block[:, :d_count].flatten().tolist())
  
+        end = time.time()
+        print(f'Computing block inverses: {(end-start)} sec')
 
         del XtX
+        
+        start = time.time()
         
         square_shape = (self.nItems, self.nItems)
         print("final step: obtaining the sparse matrix B by averaging the solutions regarding the various sets D ...")
@@ -719,45 +835,195 @@ class MRFApprox(NumpyRecommender):
             B = csc_matrix((B_sum_values / B_count_values, (B_count_rowidx, B_count_colidx)), shape=square_shape, dtype=np.float32)
         
         B[idx_diag] = 0.0
+        end = time.time()
+        print(f'forming B: {(end-start)} sec')
         
         print("forcing the sparsity pattern of A onto B ...")
+        start = time.time()
         B = csr_matrix( ( np.asarray(B[A.nonzero()]).flatten(),  A.nonzero() ), shape=B.shape, dtype=np.float32)
         B = diags(scaling, dtype=np.float32).dot(B).dot(diags(rescaling, dtype=np.float32))
+        
+        end = time.time()
+        print(f'forcing sparsity B: {(end-start)} sec')
         
         if store_dense:
             print('storing B matrix as dense')
             self.B = B.toarray()
         else:
             self.B = B
+            
+            
+    def fit(self, train_data: pd.DataFrame, uid_str: str, sid_str: str, nItems: int, 
+            alpha, threshold, max_in_col, r, dtype=np.float32, store_dense = False):    
+        if not set([uid_str, sid_str]) <= set(train_data.columns):
+            raise ValueError(f'{uid_str} or {sid_str} not present in test_data columns')
+            
+        # one might wonder why we cant just do np.unique or np.max + 1 to get nItems..
+        # depending on whether weak or strong generalisation is used, 
+        # some items might only be in the test-set, but we need B to have to correct size of nItems x nItems
+        start_overall = time.time()
+        self.nItems = nItems
+        self.store_dense = store_dense
+        self.X_train = self._parse_data(train_data, uid_str, sid_str, dtype=dtype)
+        self.alpha = alpha
+        self.threshold = threshold
+        self.r = r
+        self.max_in_col = max_in_col
+        
+        start = time.time()
+        XtX = np.dot(self.X_train.T, self.X_train).toarray()
+        end = time.time()
+        print(f'XtX: {(end-start)} sec')
+        
+        start = time.time()
+        A, XtX, scaling, rescaling = self._calculate_sparsity_pattern(XtX=deepcopy(XtX), alpha=self.alpha, threshold=self.threshold, max_in_col=self.max_in_col)
+        
+        idx_diag = np.diag_indices(XtX.shape[0])
+        XtX[idx_diag] += self.lmbda 
+        end = time.time()
+        print(f'Get A: {(end-start)} sec')        
+        
+        start = time.time()
+        # list L in the paper, sorted by item-counts per column, ties broken by item-popularities as reflected by np.diag(XtX)
+        A_col_count = A.getnnz(axis=0)
+        L = np.argsort(A_col_count + np.diag(XtX) / 2.0/ np.max(np.diag(XtX)))[::-1]  
+
+        print("iterating through steps 1,2, and 4 in section 3.2 of the paper ...")
+        todo_indicators = np.ones(A_col_count.shape[0])
+        block_list = []   # list of blocks. Each block is a list of item-indices, to be processed in step 3 of the paper
+        for i in L:
+            if todo_indicators[i] == 1:
+                n_i, _, vals=find(A[:,i])  # step 1 in paper: set n contains item i and its neighbors N
+                sorted_ind = np.argsort(np.abs(vals))[::-1]
+                n_i = n_i[sorted_ind]
+                block_list.append(n_i) # list of items in the block, to be processed in step 3 below
+                # remove possibly several items from list L, as determined by parameter r  
+                d_count = max(1, int(np.ceil(len(n_i) * self.r)))
+                d = n_i[:d_count] # set D, see step 2 in the paper
+                todo_indicators[d] = 0  # step 4 in the paper       
+                
+        end = time.time()
+        print(f'building block_list: {(end-start)} sec')
+
+        print("now step 3 in section 3.2 of the paper: iterating ...")
+        # now the (possibly heavy) computations of step 3:
+        # given that steps 1,2,4 are already done, the following for-loop could be implemented in parallel.   
+
+        B_rowidx, B_colidx, B_val = [], [], []
+        start = time.time()
+        
+        for n_i in block_list:
+            #calculate dense solution for the items in set n
+            if not len(n_i) > 0:
+                continue
+                
+            B_block = self._faster_spd_inverse( XtX[np.ix_(n_i,n_i)] , dtype=dtype)
+            #B_block = np.linalg.inv( XtX[np.ix_(n_i,n_i)] )
+            
+            B_block /= -np.diag(B_block)
+                        
+            # determine set D based on parameter r
+            d_count = max(1,int(np.ceil(len(n_i)*self.r)))
+            d = n_i[:d_count] # set D in paper
+            
+            # store the solution regarding the items in D
+            block_idx = np.meshgrid(d,n_i)
+            B_rowidx.append(block_idx[1].flatten())
+            B_colidx.append(block_idx[0].flatten())
+            B_val.append(B_block[:, :d_count].flatten())
+ 
+        end = time.time()
+        print(f'Computing block inverses: {(end-start)} sec')
+
+        del XtX
+        
+        start = time.time()
+        
+        square_shape = (self.nItems, self.nItems)
+        print("final step: obtaining the sparse matrix B by averaging the solutions regarding the various sets D ...")
+        stacked_vals = np.hstack(B_val)
+        B_sum = coo_matrix((stacked_vals, (np.hstack(B_rowidx), np.hstack(B_colidx))), shape=square_shape, dtype=np.float32).tocsr()
+        B_count = coo_matrix((np.ones(len(stacked_vals), dtype=np.float32), (np.hstack(B_rowidx), np.hstack(B_colidx))), shape=square_shape, dtype=np.float32).tocsr()
+        B_count_values = find(B_count)[2] 
+        B_sum_rowidx, B_sum_colidx, B_sum_values = find(B_sum)
+        
+        
+        if len(B_sum_values) == len(B_count_values):
+            B = csr_matrix((B_sum_values / B_count_values, (B_sum_rowidx, B_sum_colidx)), shape=square_shape, dtype=np.float32)
+            
+        else:
+            # this can happen if an entry sufficiently close to zero is created in B_sum
+            # in single precision, entries of B_block can also be zero
+            B_count_rowidx, B_count_colidx, B_count_values = find(B_count) 
+            B_sum_values = B_sum[B_count_rowidx, B_count_colidx].A1 # .A1 is the same as flattening
+            B = csr_matrix((B_sum_values / B_count_values, (B_count_rowidx, B_count_colidx)), shape=square_shape, dtype=np.float32)
+        
+        B[idx_diag] = 0.0
+        end = time.time()
+        print(f'forming B: {(end-start)} sec')
+        
+        print("forcing the sparsity pattern of A onto B ...")
+        start = time.time()
+        A_nnz = A.nonzero()
+        B = csr_matrix(( B[A_nnz].flatten().A1,  A_nnz ), shape=B.shape, dtype=np.float32)
+        B = diags(scaling, dtype=np.float32, format='csr').dot(B).dot(diags(rescaling, dtype=np.float32, format='csr'))
+        
+        end = time.time()
+        print(f'forcing sparsity B: {(end-start)} sec')
+        
+        if store_dense:
+            print('storing B matrix as dense')
+            self.B = B.toarray()
+        else:
+            self.B = B
+            
+        end_overall = time.time()
+        print(f'total: {(end_overall-start_overall)} sec')
+                    
+
         
     
     def predict(self, data: pd.DataFrame, uid_str: str, sid_str: str, 
-                k: int, return_scores: bool = False):
+                k: int, return_scores: bool = False, n_jobs=16):
         if not set([uid_str, sid_str]) <= set(data.columns):
             raise ValueError(f'{uid_str} or {sid_str} not present in data columns')
             
         if self.store_dense:
-            B = csr_matrix(self.B)            
+            B = csr_matrix(self.B)  
+        else: 
+            B = self.B
             
         self.X_test = self._parse_data(data, uid_str, sid_str)
         
-        if self.store_dense:
-            pred = np.dot(self.X_test, B) #self.pred
-            del B
-            
-        else:
-            pred = np.dot(self.X_test, self.B)
-            
-        # we dont want to predict items that the user already interacted with 
-        pred = pred + (-np.inf * self.X_test)        
+        sparse_id = identity(B.shape[0], dtype=np.float32, format='csr')    
+        B = B - np.inf * sparse_id
         
-        self.topk = argpartition_row(pred, k)
-        
-        # we need to sort manually
-        n_test = self.X_test.shape[0]
-        sorted_idx = (-pred)[np.arange(n_test)[:, None], self.topk].toarray().argsort()
-        self.topk = self.topk[np.arange(n_test)[:, None], sorted_idx]
+        self.topk = awesome_cossim_topn(A=self.X_test, B=B, ntop=k, use_threads=True, n_jobs=n_jobs)
         return self.topk
+    
+    
+    def evaluate_metrics(self, test_data_tr: pd.DataFrame, test_data_te: pd.DataFrame,
+                         uid_str: str, sid_str: str, metrics: list, n_jobs=16):
+        # if nusers_tr < nusers_te raise error
+        metric_callers = []
+        max_topk = 0
+        for metric in metrics:
+            try:
+                metric_callers.append(eval(metric))
+                max_topk = max(max_topk, int(metric.split("k=")[-1].strip(")")))
+            except:
+                raise NotImplementedError('metrics={} not implemented.'.format(metric))
+        
+        X_test_te = self._parse_data(test_data_te, uid_str, sid_str)
+        topk = self.predict(test_data_tr, uid_str, sid_str, max_topk, n_jobs=n_jobs)
+        
+        n_test_user = X_test_te.shape[0]
+        results = [[fn(topk[row_idx].indices, X_test_te[row_idx].indices) for fn in metric_callers] \
+                    for row_idx in range(n_test_user)]
+        
+        average_result = np.average(np.array(results), axis=0).tolist()
+        return_dict = dict(zip(metrics, average_result))
+        return return_dict 
         
         
 class ADMM_slim(NumpyRecommender):
