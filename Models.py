@@ -17,8 +17,8 @@ def sparsify(B, threshold, max_in_col=None):
     Sets all elements of B which are smaller than the threshold (in absolute value) to zero. Additionally,
     it is ensured that there are at most max_in_col many nonzero entries per column.
     
-    Limiting the number of elements per column in the model matrix means limiting the number of "neighbours" an item can have, if the predictions are made as:
-    pred = X_test @ B
+    Limiting the number of elements per column in the model matrix has the effect of limiting the number of "neighbours" 
+    an item can have, assuming predictions are via: pred = X_test @ B
     """
 
     
@@ -51,14 +51,26 @@ def sparsify(B, threshold, max_in_col=None):
 
     
 def sparsity_pattern_cov(XtX, n_users, alpha, threshold, max_in_col):
+    """
+    Assuming the data matrix X contains columns of realisations of a RV, this matrix computes a sparsity
+    pattern based on thresholding (in absolute value) the empirical correlation matrix. Additionally, a
+    constraint regarding the maximum number of nonzero items per column can be enforced.
+    
+    The exponent alpha controls how much of the variance is removed from the entries of (X - mu).T * (X - mu)
+    
+    The case alpha=1 corresponds to the correlation matrix, and alpha=0 corresponds the covariance matrix.
+    
+    NOTE: This works *only* for binary data (i.e data matrix X is binary), otherwise mu != diag(XtX).
+    """
+    
     # if alpha=1, then XtX becomes the correlation matrix below
     XtX_diag = np.diag(XtX)
     idx_diag = np.diag_indices(XtX.shape[0])
 
-    mu = XtX_diag / n_users
+    mu = XtX_diag / n_users # only valid for binary data
     variance_times_usercount = XtX_diag - mu * mu * n_users
 
-    # standardizing the data-matrix XtX (if alpha=1, then XtX becomes the correlation matrix)
+    # standardizing the data-matrix XtX (if alpha=1, then XtX is the correlation matrix)
     XtX -= mu[:,None] * (mu * n_users)
     rescaling = np.power(variance_times_usercount, alpha / 2.0) 
     scaling = 1.0  / rescaling
@@ -86,6 +98,9 @@ def sparsity_pattern_cov(XtX, n_users, alpha, threshold, max_in_col):
 
 
 class BaseRecommender:
+    """
+    Base Class for Recommenders, defines a common evalutation method.
+    """
     def evaluate_metrics(self, test_data_pr: pd.DataFrame, test_data_eval: pd.DataFrame,
                          uid_str: str, sid_str: str, metrics: list):
         # if nusers_pr < nusers_eval raise error
@@ -123,6 +138,10 @@ class BaseRecommender:
 
 
 class NumpyRecommender(BaseRecommender):
+    """
+    Base Class for Recommenders using numpy. Defines a method to convert a pd.DataFrame containing 
+    interaction data into a sparse matrix in the csr format.
+    """
     def _parse_data(self, data: pd.DataFrame, uid_str: str, sid_str: str, dtype=np.float32):
         nUsers = len(data[uid_str].unique())
         users = data[uid_str].astype('category').cat.codes.values
@@ -133,6 +152,10 @@ class NumpyRecommender(BaseRecommender):
     
     
 class TorchRecommender(BaseRecommender):
+    """
+    Base Class for Recommenders using torch. Defines a method to convert a pd.DataFrame containing 
+    interaction data into a sparse matrix in the coo format.
+    """
     def _parse_data_csr(self, data: pd.DataFrame, uid_str: str, sid_str: str):
         """
         Unused, since multiplying csr matricies in a loop can cause memory leak.
@@ -258,9 +281,6 @@ class ItemKNN(NumpyRecommender):
         if not set([uid_str, sid_str]) <= set(train_data.columns):
             raise ValueError(f'{uid_str} or {sid_str} not present in test_data columns')
             
-        # one might wonder why we cant just do np.unique or np.max + 1 to get nItems..
-        # depending on whether weak or strong generalisation is used, 
-        # some items might only be in the test-set, but we need B to have to correct size of nItems x nItems
         self.nItems = nItems
         self.X_train = self._parse_data(train_data, uid_str, sid_str)
         
@@ -349,7 +369,13 @@ class ItemKNN(NumpyRecommender):
     
 class EASE(NumpyRecommender):
     """
-    EASE
+    EASE (Embarrassingly Shallow Autoencoder) is a linear autoencoder which solves the following 
+    optimization problem:
+    
+    \min_B \quad &  \left\Vert X - X \cdot B \right\Vert^2_F + \lambda \left\Vert B \right\Vert^2_F \\
+    \text{s.t.} \quad & \mathrm{diag(B)}=0
+    
+    The closed form solution is obtained by computing: B = I - G * dMat(1 ./ diag(G) ), with G = (X.T * X + lambda * I) ^-1.
     """
     
     def __init__(self, lmbda):
@@ -441,7 +467,8 @@ class DLAE(NumpyRecommender):
     """
     Denoising Linear Autoencoder. For details, see: https://proceedings.neurips.cc/paper/2020/file/e33d974aae13e4d877477d51d8bafdc4-Paper.pdf
     
-    Default case is not computing the inverse explicitly to obtain the model matrix, but rather making predictions via solving a Linear System using Cholesky.
+    Compared to the EASE model, a different regularization is used and the diag(B)=0 constraint is dropped. 
+    For this model it is possible to solve a linear system instead of computing the inverese explicitly (default case)
     """
     def __init__(self, lmbda, p, method='chol'):
         self.lmbda = lmbda
@@ -558,7 +585,12 @@ class EDLAE(NumpyRecommender):
     """
     Emphasized Denoising Linear Autoencoder. For details, see: https://proceedings.neurips.cc/paper/2020/file/e33d974aae13e4d877477d51d8bafdc4-Paper.pdf
     
-    Inverse is computed via LAPACK routine, which is faster than using np.linalg.inv, since this doesnt exploit the definiteness of the Matrix.
+    Only difference to the EASE model is a different regularizer: 
+    
+    \min_B \quad & \left\Vert X - X \cdot B \right\Vert^2_F + \left\Vert \Lambda^{\frac{1}{2}} \cdot B \right\Vert^2_F  
+    \text{s.t.} \quad & \mathrm{diag(B)}=0
+    
+    The closed form solution is obtained by computing: B = I - P * dMat(1 ./ diag(P) ), with P = (X.T * X + Lambda) ^-1.
     """
     
     def __init__(self, lmbda, p):
@@ -642,14 +674,126 @@ class EDLAE(NumpyRecommender):
         sorted_idx = (-pred)[np.arange(n_test)[:, None], self.topk].argsort()
         self.topk = self.topk[np.arange(n_test)[:, None], sorted_idx]
         return self.topk
+
+    
+    
+class MRFDense(NumpyRecommender):
+    """
+    Dense solution in the MRF formulation.
+    """
+    
+    def __init__(self, lmbda, mean_removal=False):
+        self.lmbda = lmbda
+        self.mean_removal = mean_removal
+        
+        
+    def _upper_triangular_to_symmetric(self, upper_triang):
+        upper_triang += np.triu(upper_triang, k=1).T
+
+
+    def _faster_spd_inverse(self, matrix, dtype=np.float32):
+        start = time.time()
+        if matrix.dtype != dtype:
+            raise ValueError('Supplied dtype doesnt match matrix dtype')
+            
+        cholesky_decomp = cholesky(matrix)
+        print(f'Cholesky: {time.time() - start}')
+        start = time.time()
+        
+        if dtype == np.float32:
+            inv, info = spotri(cholesky_decomp)
+        elif dtype == np.float64:
+            inv, info = dpotri(cholesky_decomp) 
+            
+        else:
+            raise ValueError(f'Unsupported dtype: {dtype}')
+            
+        if info != 0:
+            raise ValueError('spotri failed on input')
+        self._upper_triangular_to_symmetric(inv)
+        print(f'Computing Inverse based on Chol: {time.time() - start}')
+        return inv
+
+        
+    def fit(self, train_data: pd.DataFrame, uid_str: str, sid_str: str, nItems: int, alpha):    
+        if not set([uid_str, sid_str]) <= set(train_data.columns):
+            raise ValueError(f'{uid_str} or {sid_str} not present in test_data columns')
+        self.nItems = nItems
+        self.X_train = self._parse_data(train_data, uid_str, sid_str)
+        self.alpha = alpha
+        
+        # calculate the closed-form solution to the optimization problem
+        XtX = np.dot(self.X_train.T, self.X_train).toarray()
+
+        usercount = self.X_train.shape[0]
+        
+        XtX_diag = np.diag(XtX)
+        
+        mu = XtX_diag / usercount
+        self.mu = mu
+        variance_times_usercount = XtX_diag - mu * mu * usercount
+        
+        # standardizing the data-matrix XtX (if alpha=1, then XtX becomes the correlation matrix)
+        XtX -= mu[:,None] * (mu * usercount)
+        rescaling = np.power(variance_times_usercount, self.alpha / 2.0) 
+        scaling = 1.0  / rescaling
+        XtX = scaling[:,None].astype(np.float32) * XtX * scaling.astype(np.float32)
+        
+        idx_diag = np.diag_indices(XtX.shape[0])
+        XtX[idx_diag] += self.lmbda 
+        
+        self.XtX = XtX
+        
+        G = self._faster_spd_inverse(XtX) 
+        self.B = G / (-np.diag(G))
+        
+        self.B = scaling[:,None].astype(np.float32) * self.B * rescaling.astype(np.float32)
+        np.fill_diagonal(self.B, val=0.)
+            
+    
+    def predict(self, data: pd.DataFrame, uid_str: str, sid_str: str, 
+                k: int, return_scores: bool = False):
+        if not set([uid_str, sid_str]) <= set(data.columns):
+            raise ValueError(f'{uid_str} or {sid_str} not present in data columns')
+               
+        self.k = k
+        self.X_test = self._parse_data(data, uid_str, sid_str)
+        X_rowidx, X_colidx, _ = find(self.X_test)
+        
+        X_test_dense = self.X_test.toarray()
+        
+        if self.mean_removal:
+            pred = self.mu + np.dot(X_test_dense - self.mu, self.B) 
+        else:
+            pred = np.dot(X_test_dense, self.B) 
+            
+        del X_test_dense 
+            
+        # we dont want to predict items that the user already interacted with 
+        pred[X_rowidx, X_colidx] = -np.inf
+        
+        # top k items most popular items for each user
+        self.topk = argpartition(-pred, self.k - 1, axis=1)[:, :self.k]
+        
+        # we need to sort manually
+        n_test = self.X_test.shape[0]
+        sorted_idx = (-pred)[np.arange(n_test)[:, None], self.topk].argsort()
+        self.topk = self.topk[np.arange(n_test)[:, None], sorted_idx]
+        return self.topk    
     
 
 
 class MRFApprox(NumpyRecommender):
     """
-    No mean removal and different regularization.
+    Sparse approximation to the linear autoencoder-type models obtained by representing the items as 
+    nodes in a sparse graph of a Markov Random Field.
     
-    Based on the code from: https://github.com/hasteck/MRF_NeurIPS_2019
+    The sparse graph structure is obtained by thresholding (in absolute value) the empirical correlation
+    matrix.
+    
+    The computational advantage of this model is that only matrices of the (size max_in_col x max_in_col) have to 
+    be inverted. This is much cheaper than inverting the (n_Items x n_items) Matrix as required by the linear 
+    Autoencoder models. The parameter max_in_col should be chosen such that: max_in_col << n_items
     """
     def __init__(self, lmbda):
         self.lmbda = lmbda
@@ -872,6 +1016,7 @@ class MRFApprox(NumpyRecommender):
         
         start = time.time()
         XtX = np.dot(self.X_train.T, self.X_train).toarray()
+        self.mu = np.diag(XtX) / self.X_train.shape[0]
         end = time.time()
         print(f'XtX: {(end-start)} sec')
         
@@ -1024,6 +1169,8 @@ class MRFApprox(NumpyRecommender):
         average_result = np.average(np.array(results), axis=0).tolist()
         return_dict = dict(zip(metrics, average_result))
         return return_dict 
+    
+
         
         
 class ADMM_slim(NumpyRecommender):
