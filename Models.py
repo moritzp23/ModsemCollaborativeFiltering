@@ -50,7 +50,7 @@ def sparsify(B, threshold, max_in_col=None):
     return A 
 
     
-def sparsity_pattern_cov(XtX, n_users, alpha, threshold, max_in_col):
+def sparsity_pattern_cov(XtX, n_users, alpha, threshold, max_in_col, return_XtX=False):
     """
     Assuming the data matrix X contains columns of realisations of a RV, this matrix computes a sparsity
     pattern based on thresholding (in absolute value) the empirical correlation matrix. Additionally, a
@@ -93,7 +93,10 @@ def sparsity_pattern_cov(XtX, n_users, alpha, threshold, max_in_col):
         A[  j[k], i ] = 0.0
     A.eliminate_zeros()
     print("Resulting sparsity of A: {}".format( A.nnz*1.0 / A.shape[0] / A.shape[0]) )
-
+    
+    if return_XtX:
+        return A, XtX
+    
     return A 
 
 
@@ -733,21 +736,17 @@ class MRFDense(NumpyRecommender):
         self.mu = mu
         variance_times_usercount = XtX_diag - mu * mu * usercount
         
-        # standardizing the data-matrix XtX (if alpha=1, then XtX becomes the correlation matrix)
+        # covariance matrix
         XtX -= mu[:,None] * (mu * usercount)
-        rescaling = np.power(variance_times_usercount, self.alpha / 2.0) 
-        scaling = 1.0  / rescaling
-        XtX = scaling[:,None].astype(np.float32) * XtX * scaling.astype(np.float32)
         
         idx_diag = np.diag_indices(XtX.shape[0])
         XtX[idx_diag] += self.lmbda 
         
         self.XtX = XtX
         
-        G = self._faster_spd_inverse(XtX) 
+        G = self._faster_spd_inverse(XtX)  # precision matrix
         self.B = G / (-np.diag(G))
         
-        self.B = scaling[:,None].astype(np.float32) * self.B * rescaling.astype(np.float32)
         np.fill_diagonal(self.B, val=0.)
             
     
@@ -1169,8 +1168,7 @@ class MRFApprox(NumpyRecommender):
         average_result = np.average(np.array(results), axis=0).tolist()
         return_dict = dict(zip(metrics, average_result))
         return return_dict 
-    
-
+     
         
         
 class ADMM_slim(NumpyRecommender):

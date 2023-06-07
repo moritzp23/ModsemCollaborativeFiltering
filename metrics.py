@@ -1,3 +1,4 @@
+# partly adapted from: 
 from numpy import log2, minimum, log
 
 class Recall(object):
@@ -6,7 +7,10 @@ class Recall(object):
         self.topk = k
 
     def __call__(self, topk_items, true_items):
-        topk_items = topk_items[:self.topk]
+        # in case there are less then self.topk many predictions
+        min_topk = minimum(self.topk, len(topk_items))
+        topk_items = topk_items[:min_topk]
+        
         hit_items = set(true_items) & set(topk_items)
         recall = len(hit_items) / minimum(self.topk, len(true_items))
         return recall
@@ -18,8 +22,11 @@ class DCG(object):
     def __init__(self, k=1):
         self.topk = k
 
-    def __call__(self, topk_items, true_items):
-        topk_items = topk_items[:self.topk]
+    def __call__(self, topk_items, true_items):\
+        # in case there are less then self.topk many predictions
+        min_topk = minimum(self.topk, len(topk_items)) 
+        topk_items = topk_items[:min_topk]
+        
         true_items = set(true_items)
         dcg = 0
         for i, item in enumerate(topk_items):
@@ -34,7 +41,10 @@ class NDCG(object):
         self.topk = k
 
     def __call__(self, topk_items, true_items):
-        topk_items = topk_items[:self.topk]
+        # in case there are less then self.topk many predictions
+        min_topk = minimum(self.topk, len(topk_items))
+        topk_items = topk_items[:min_topk]
+        
         dcg_fn = DCG(k=self.topk)
         m = minimum(self.topk, len(true_items))
         idcg = dcg_fn(true_items[:m], true_items)
