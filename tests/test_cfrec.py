@@ -117,3 +117,14 @@ def test_recvae_smoke(X):
     model.fit(X[:200], X[200:250], X[250:])
     assert model.score(X[:7]).shape == (7, X.shape[1])
     assert len(model.history) == 2
+
+
+def test_flow_smoke(X):
+    pytest.importorskip('torch')
+    from cfrec.models import FlowMatchingCF
+    model = FlowMatchingCF(hidden_dim=16, n_epochs=2, batch_size=64, device='cpu', verbose=False)
+    model.fit(X[:200], X[200:250], X[250:])
+    assert model.score(X[:7]).shape == (7, X.shape[1])
+    import torch
+    samples = model.sample(torch.as_tensor(X[:3].toarray()), n_samples=4, n_steps=5)
+    assert samples.shape == (4, 3, X.shape[1])

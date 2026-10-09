@@ -6,6 +6,7 @@
 """
 import argparse
 import ast
+import inspect
 import json
 import time
 from pathlib import Path
@@ -34,6 +35,7 @@ parser.add_argument('--split', choices=['test', 'val'], default='test')
 parser.add_argument('--set', nargs='*', default=[], metavar='KEY=VALUE', help='hyperparameter overrides')
 parser.add_argument('--root', default='data')
 parser.add_argument('--out', default='results', help='directory for the json result')
+parser.add_argument('--tag', default='', help='suffix for the result file name')
 args = parser.parse_args()
 
 params = {**BEST_PARAMS.get(args.model, {}).get(args.dataset, {}), **parse_overrides(args.set)}
@@ -43,7 +45,7 @@ print(f'{args.model}({params})')
 
 model = MODELS[args.model](**params)
 start = time.perf_counter()
-if args.model == 'recvae':  # model selection on the validation users
+if 'X_val_in' in inspect.signature(model.fit).parameters:  # model selection on the validation users
     model.fit(data.train, data.val_tr, data.val_te)
 else:
     model.fit(data.train)
@@ -61,6 +63,9 @@ out = Path(args.out)
 out.mkdir(exist_ok=True)
 record = dict(model=args.model, dataset=args.dataset, split=args.split, params=params,
               fit_time=fit_time, eval_time=eval_time, **result)
-path = out / f'{args.model}_{args.dataset}_{args.split}.json'
+if hasattr(model, 'history'):
+    record['history'] = model.history
+tag = f'_{args.tag}' if args.tag else ''
+path = out / f'{args.model}_{args.dataset}_{args.split}{tag}.json'
 path.write_text(json.dumps(record, indent=2))
 print(f'saved {path}')

@@ -51,6 +51,15 @@ python scripts/approximations.py ml-20m correlation    # pattern from thresholde
 python scripts/approximations.py ml-20m mrf            # sparse MRF approximation sweep
 ```
 
+Conditional flow matching (CF as a Bayesian inverse problem, `models/flow.py`): learns the posterior
+p(x | y) of a user's full interaction vector x given an observed subset y, amortized over users. Ranking
+uses the one-step posterior mean E[x | y]; posterior samples come from integrating the flow ODE.
+
+```bash
+python scripts/run.py flow ml-20m                       # train (model selection on validation users)
+python scripts/flow_scoring.py ml-20m                   # posterior mean vs. averaged ODE samples
+```
+
 From Python:
 
 ```python
@@ -82,6 +91,7 @@ src/cfrec/
     admm.py        ADMMSlim (sparse EDLAE / SLIM via ADMM)
     lowrank.py     SVD / eigen low-rank approximations
     recvae.py      RecVAE
+    flow.py        conditional flow matching (amortized posterior p(x | y))
 scripts/           prepare_data.py, run.py, approximations.py
 tests/             unit tests (pytest)
 legacy/            original notebooks and Models.py from the report, kept for reference
