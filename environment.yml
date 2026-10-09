@@ -1,0 +1,16 @@
+name: cfrec
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - scipy
+  - pandas
+  - bottleneck
+  - matplotlib
+  - pytest
+  - pip
+  - pip:
+      - sparse-dot-topn>=1.1
+      - -e .
+# For RecVAE (GPU): pip install -e ".[vae]"  (or install pytorch from conda/pytorch channel)
