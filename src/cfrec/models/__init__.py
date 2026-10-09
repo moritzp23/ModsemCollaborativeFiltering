@@ -18,10 +18,8 @@ MODELS = {
 }
 
 try:  # optional dependency: pip install -e ".[vae]"
-    from .flow import FlowMatchingCF
     from .recvae import RecVAE
     MODELS['recvae'] = RecVAE
-    MODELS['flow'] = FlowMatchingCF
 except ImportError:
     pass
 

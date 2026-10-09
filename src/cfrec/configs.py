@@ -34,8 +34,8 @@ BEST_PARAMS = {
         'netflix': dict(gamma=0.0035, n_epochs=50),
         'msd': dict(gamma=0.01, n_epochs=100),
     },
-    'flow': {
-        'ml-20m': dict(keep_prob=0.5, weight_decay=0.1, n_epochs=30),
+    'fm': {
+        'ml-20m': dict(velocity_param='denoiser-gated', keep_prob=0.5, weight_decay=0.1, epochs=30),
     },
     # sparse models: settings for a density of ~0.5% of the item-item matrix
     'mrf': {

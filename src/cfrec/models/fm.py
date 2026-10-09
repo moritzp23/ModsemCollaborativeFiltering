@@ -20,6 +20,8 @@ import os
 # the dense training matrix (~9 GB for ML-20M) lives on the device: allow more than JAX's default 75%
 os.environ.setdefault('XLA_PYTHON_CLIENT_MEM_FRACTION', '0.95')
 
+import inspect
+import pickle
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -223,12 +225,13 @@ class FMRecommender(Recommender):
     noise_std:      observation noise: additive Gaussian noise on the (l2-normalised) y during training;
                     at inference y is used noise-free
     select:         'last' (fmbayes default) or 'ndcg' (best validation NDCG@100, the report's protocol)
+    score_samples:  0 = rank by the one-step posterior mean; S > 0 = by the average of S ODE samples
     """
 
     def __init__(self, velocity_param='denoiser-gated', hidden_dim=600, depth=2, activation='swish',
                  keep_prob=0.5, flip_prob=0., noise_std=0., epochs=30, batch_size=500, learning_rate=1e-3, optimizer='adamw',
                  weight_decay=0.1, schedule='cosine', select='ndcg', eval_every=1, steps=10, seed=0,
-                 score_batch=1000, rank=1000, edlae_params=None, verbose=True):
+                 score_batch=1000, score_samples=0, rank=1000, edlae_params=None, verbose=True):
         self.velocity_param = velocity_param
         self.hidden_dim = hidden_dim
         self.depth = depth
@@ -247,6 +250,7 @@ class FMRecommender(Recommender):
         self.steps = steps
         self.seed = seed
         self.score_batch = score_batch
+        self.score_samples = score_samples
         self.rank = rank
         self.edlae_params = edlae_params or {'lmbda': 300, 'p': 0.33}
         self.verbose = verbose
@@ -332,5 +336,30 @@ class FMRecommender(Recommender):
         return np.asarray(x1).reshape(n_samples, *y.shape)
 
     def score(self, X: sp.csr_matrix) -> np.ndarray:
+        if self.score_samples:   # Monte Carlo posterior mean; batches keep samples x users x items on the device
+            bs = max(1, self.score_batch // self.score_samples)
+            return np.concatenate([self.sample(X[i:i + bs], self.score_samples).mean(0)
+                                   for i in range(0, X.shape[0], bs)])
         return np.concatenate([self.posterior_mean(X[i:i + self.score_batch])
                                for i in range(0, X.shape[0], self.score_batch)])
+
+    # ---- checkpoints (as in fmbayes: a pickle with params and config) ------------------------
+    def get_config(self) -> dict:
+        names = [n for n in inspect.signature(type(self).__init__).parameters if n != 'self']
+        return {n: getattr(self, n) for n in names}
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump({'params': jax.device_get(self.params), 'config': self.get_config(),
+                         'n_items': self.model.x_dim, 'history': getattr(self, 'history', [])}, f)
+        return path
+
+    @classmethod
+    def load(cls, path: str, **overrides) -> 'FMRecommender':
+        with open(path, 'rb') as f:
+            ckpt = pickle.load(f)
+        model = cls(**{**ckpt['config'], **overrides}).build(ckpt['n_items'])
+        model.params = jax.device_put(ckpt['params'])
+        model.history = ckpt.get('history', [])
+        return model

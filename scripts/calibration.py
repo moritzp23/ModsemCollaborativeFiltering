@@ -1,8 +1,10 @@
 """Calibration of P(x_i = 1 | y) and of the number of hidden items, on the test users.
 
-    python scripts/calibration.py ml-20m --flow k05=results/flow_ml-20m.pt k08=results/flow_ml-20m_k08.pt
+    python scripts/calibration.py ml-20m --flow k05=results/fm_ml-20m_k05.pkl k08=results/fm_ml-20m_k08.pkl
 
-Models: EASE + Platt scaling (fitted on validation users), and each flow checkpoint, raw and + Platt.
+Models: EASE + Platt scaling (fitted on validation users), and each flow-matching checkpoint
+(`FMRecommender.save`, e.g. `run.py fm ... --save`), raw and + Platt. Probabilities are the one-step
+posterior means, clipped to (0, 1).
 For the flows, count intervals from joint posterior samples are compared with intervals from independent
 Bernoulli marginals. Writes results/calibration_<dataset>.json and a reliability-diagram png.
 """
@@ -11,18 +13,16 @@ import json
 from pathlib import Path
 
 import numpy as np
-import torch
 from scipy.special import expit
 
 from cfrec.calibration import CalibrationAccumulator, fit_platt, sample_count_coverage
 from cfrec.configs import BEST_PARAMS
 from cfrec.data import load_dataset
-from cfrec.models import EASE, FlowMatchingCF
+from cfrec.models import EASE, FMRecommender
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument('dataset', choices=['ml-20m', 'netflix', 'msd'])
-parser.add_argument('--flow', nargs='+', default=[], metavar='NAME=CKPT',
-                    help='flow checkpoints; keep_prob is read from NAME if it is of the form k08 / k05')
+parser.add_argument('--flow', nargs='+', default=[], metavar='NAME=CKPT', help='FMRecommender checkpoints')
 parser.add_argument('--n-samples', type=int, default=64)
 parser.add_argument('--n-steps', type=int, default=10)
 parser.add_argument('--batch-size', type=int, default=500)
@@ -67,19 +67,13 @@ report('EASE+Platt', evaluate_probs(lambda X: expit(a * ease.score(X) + b)))
 # ---- flows
 for spec in args.flow:
     name, ckpt = spec.split('=')
-    params = dict(BEST_PARAMS['flow'][args.dataset], verbose=False, batch_size=args.batch_size)
-    if name.startswith('k') and name[1:].isdigit():
-        params['keep_prob'] = int(name[1:]) / 10
-    model = FlowMatchingCF(**params).build(data.n_items)
-    model.net.load_state_dict(torch.load(ckpt, map_location=model.device))
-    torch.manual_seed(0)
+    model = FMRecommender.load(ckpt, verbose=False, score_batch=args.batch_size)
 
     def probs(X):
-        return model.posterior_mean(torch.as_tensor(X.toarray(), device=model.device)).cpu().numpy()
+        return np.clip(model.posterior_mean(X), 1e-6, 1 - 1e-6)
 
     def samples(X, n):
-        return model.sample(torch.as_tensor(X.toarray(), device=model.device), n_samples=n,
-                            n_steps=args.n_steps).cpu().numpy()
+        return model.sample(X, n_samples=n, steps=args.n_steps)
 
     extra = sample_count_coverage(samples, X_in, X_out, args.n_samples, batch_size=100)
     report(f'flow-{name}', evaluate_probs(probs), extra)

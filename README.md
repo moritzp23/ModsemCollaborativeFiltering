@@ -51,24 +51,19 @@ python scripts/approximations.py ml-20m correlation    # pattern from thresholde
 python scripts/approximations.py ml-20m mrf            # sparse MRF approximation sweep
 ```
 
-Conditional flow matching (CF as a Bayesian inverse problem, `models/flow.py`): learns the posterior
-p(x | y) of a user's full interaction vector x given an observed subset y, amortized over users. Ranking
+Conditional flow matching (CF as a Bayesian inverse problem, `models/fm.py`): learns the posterior
+p(x | y) of a user's full interaction vector x given an observed subset y, amortized over users. Built on
+`fmbayes` (`conditional-flows-UQ/fmbayes`, JAX): its network registry, training loop (`flows.train.fit`,
+with the masking forward operator as `y_fn`) and ODE transport, plus CF extensions in the same style
+(`denoiser-gated`, `affine-tgated`, `gauss-ease`: the Gaussian head with a low-rank EASE mean). Ranking
 uses the one-step posterior mean E[x | y]; posterior samples come from integrating the flow ODE.
-
-```bash
-python scripts/run.py flow ml-20m                       # train (model selection on validation users)
-python scripts/flow_scoring.py ml-20m                   # posterior mean vs. averaged ODE samples
-```
-
-The same approach built on `fmbayes` (`conditional-flows-UQ/fmbayes`) (JAX; conditional flow matching for Bayesian
-inverse problems) lives in `models/fm.py`: fmbayes' network registry, training loop (`flows.train.fit`, the
-masking forward operator as its `y_fn`) and ODE transport, plus CF extensions in the same style
-(`denoiser-gated`, `affine-tgated`, `gauss-ease`: fmbayes' Gaussian head with a low-rank EASE mean).
 It needs its own environment (Python >= 3.13, jax 0.6):
 
 ```bash
-conda env create -f environment-fm.yml      # env `cfrec-fm`
-python scripts/run.py fm ml-20m --set velocity_param=denoiser-gated
+conda env create -f environment-fm.yml                  # env `cfrec-fm`
+python scripts/run.py fm ml-20m --save results/fm_ml-20m.pkl     # model selection on validation users
+python scripts/flow_scoring.py ml-20m --load results/fm_ml-20m.pkl   # posterior mean vs. ODE samples
+python scripts/calibration.py ml-20m --flow fm=results/fm_ml-20m.pkl # calibration vs. EASE + Platt
 ```
 
 From Python:
@@ -90,6 +85,7 @@ src/cfrec/
   data.py          download / preprocessing / loading (csr matrices, aligned fold-in & held-out rows)
   metrics.py       vectorized Recall@k, NDCG@k, top-k selection
   evaluation.py    strong-generalization evaluation with standard errors
+  calibration.py   reliability, ECE, Platt scaling, coverage of hidden-item counts
   timing.py        inference latency (batch of 1000 users / single query)
   linalg.py        fast SPD inverse (Cholesky + LAPACK potri), Gram matrix
   sparse.py        sparsity patterns (magnitude, thresholded correlation)
@@ -102,8 +98,8 @@ src/cfrec/
     admm.py        ADMMSlim (sparse EDLAE / SLIM via ADMM)
     lowrank.py     SVD / eigen low-rank approximations
     recvae.py      RecVAE
-    flow.py        conditional flow matching (amortized posterior p(x | y))
-scripts/           prepare_data.py, run.py, approximations.py
+    fm.py          conditional flow matching on fmbayes (amortized posterior p(x | y))
+scripts/           prepare_data.py, run.py, approximations.py, flow_scoring.py, calibration.py
 tests/             unit tests (pytest)
 legacy/            original notebooks and Models.py from the report, kept for reference
 ```

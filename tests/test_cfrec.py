@@ -119,17 +119,6 @@ def test_recvae_smoke(X):
     assert len(model.history) == 2
 
 
-def test_flow_smoke(X):
-    pytest.importorskip('torch')
-    from cfrec.models import FlowMatchingCF
-    model = FlowMatchingCF(hidden_dim=16, n_epochs=2, batch_size=64, device='cpu', verbose=False)
-    model.fit(X[:200], X[200:250], X[250:])
-    assert model.score(X[:7]).shape == (7, X.shape[1])
-    import torch
-    samples = model.sample(torch.as_tensor(X[:3].toarray()), n_samples=4, n_steps=5)
-    assert samples.shape == (4, 3, X.shape[1])
-
-
 def test_calibration_platt_and_ece():
     from scipy.special import expit
     from cfrec.calibration import CalibrationAccumulator, fit_platt
@@ -165,3 +154,13 @@ def test_fmbayes_models_smoke(X, velocity_param, tmp_path, monkeypatch):
         x0 = jax.random.normal(jax.random.key(0), y.shape)
         f = lambda x: x + m.model.apply(m.params, jnp.hstack([x, y, 0.]))
         assert jnp.allclose(f(x0), f(-x0), atol=1e-4)
+
+
+def test_fmbayes_save_load_roundtrip(X, tmp_path):
+    pytest.importorskip('fmbayes')
+    from cfrec.models import FMRecommender
+    m = FMRecommender(velocity_param='denoiser-gated', hidden_dim=16, epochs=1, batch_size=50, verbose=False)
+    m.fit(X[:200], X[200:250], X[250:])
+    loaded = FMRecommender.load(m.save(str(tmp_path / 'fm.pkl')), verbose=False)
+    np.testing.assert_allclose(loaded.score(X[:5]), m.score(X[:5]), rtol=1e-6)
+    assert loaded.get_config() == {**m.get_config(), 'verbose': False}
