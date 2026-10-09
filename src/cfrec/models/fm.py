@@ -90,6 +90,7 @@ class NNGaussEASE(NNGaussian):
     (`ease_params0`), so the model starts at the (low-rank) EDLAE posterior mean.
     """
     rank: int = 1000
+    freeze_lowrank: bool = False    # keep U, V at the EDLAE factors (use with weight_decay = 0)
 
     def setup(self):
         NNAffine.setup(self)        # the core MLP; no dense (x_dim x x_dim) mean head
@@ -101,7 +102,10 @@ class NNGaussEASE(NNGaussian):
         self.mean_bias = self.param('mean_bias', nn.initializers.zeros, (self.x_dim,), self.dtype)
 
     def _mean(self, y):
-        return self.mean_scale * ((y @ self.U) @ self.V.T) + self.obs_scale * y + self.mean_bias
+        U, V = self.U, self.V
+        if self.freeze_lowrank:
+            U, V = jax.lax.stop_gradient(U), jax.lax.stop_gradient(V)
+        return self.mean_scale * ((y @ U) @ V.T) + self.obs_scale * y + self.mean_bias
 
     def _corr(self, inputs, xt, y, t, m):
         return self.core(jnp.concatenate([t * xt, l2_rows(y), t], axis=-1))
@@ -189,10 +193,11 @@ def _dense(X: sp.csr_matrix):
 
 
 def ease_params0(params, X: sp.csr_matrix, rank: int, keep_prob: float, edlae_params: dict,
-                 cache: str | None = None):
+                 cache: str | None = None, s2_init: str = 'popularity'):
     """Initial parameters for `NNGaussEASE`: U, V from the rank-`rank` eigen-approximation of EDLAE
     (`LowRankFactorization(method='eig')`), s^2 from item popularity, mean_scale = 1 / keep_prob (the
-    observation keeps only that fraction of the items EDLAE was fitted on)."""
+    observation keeps only that fraction of the items EDLAE was fitted on). `s2_init='one'` starts s^2 at 1,
+    i.e. at fmbayes' affine skip a(t) x_t (no stiffness at t -> 1)."""
     from .linear import EDLAE
     from .lowrank import LowRankFactorization
 
@@ -206,7 +211,7 @@ def ease_params0(params, X: sp.csr_matrix, rank: int, keep_prob: float, edlae_pa
         if cache:
             np.savez(cache, U=U, V=V)
     p = np.asarray(X.mean(axis=0)).ravel()
-    log_s2 = np.log(np.clip(p * (1 - p), 1e-4, 0.25)).astype(np.float32)
+    log_s2 = (np.zeros_like(p) if s2_init == 'one' else np.log(np.clip(p * (1 - p), 1e-4, 0.25))).astype(np.float32)
     new = dict(params['params'])
     new.update(U=jnp.asarray(U), V=jnp.asarray(V), log_s2=jnp.asarray(log_s2),
                mean_scale=jnp.asarray(1.0 / keep_prob, jnp.float32))
@@ -231,7 +236,8 @@ class FMRecommender(Recommender):
     def __init__(self, velocity_param='denoiser-gated', hidden_dim=600, depth=2, activation='swish',
                  keep_prob=0.5, flip_prob=0., noise_std=0., epochs=30, batch_size=500, learning_rate=1e-3, optimizer='adamw',
                  weight_decay=0.1, schedule='cosine', select='ndcg', eval_every=1, steps=10, seed=0,
-                 score_batch=1000, score_samples=0, rank=1000, edlae_params=None, verbose=True):
+                 score_batch=1000, score_samples=0, rank=1000, edlae_params=None, freeze_lowrank=False,
+                 s2_init='popularity', verbose=True):
         self.velocity_param = velocity_param
         self.hidden_dim = hidden_dim
         self.depth = depth
@@ -252,12 +258,15 @@ class FMRecommender(Recommender):
         self.score_batch = score_batch
         self.score_samples = score_samples
         self.rank = rank
+        self.freeze_lowrank = freeze_lowrank
+        self.s2_init = s2_init
         self.edlae_params = edlae_params or {'lmbda': 300, 'p': 0.33}
         self.verbose = verbose
         self.normalise_y = velocity_param not in RAW_Y_MODELS
 
     def build(self, n_items: int):
-        kw = {'rank': self.rank} if self.velocity_param == 'gauss-ease' else {}
+        kw = ({'rank': self.rank, 'freeze_lowrank': self.freeze_lowrank}
+              if self.velocity_param == 'gauss-ease' else {})
         self.model = build_model(self.velocity_param, n_items, self.hidden_dim, self.depth, self.activation, **kw)
         self._apply = jax.jit(jax.vmap(self.model.apply, in_axes=(None, 0)))
         self._transport = make_flow_transport(self.model, method='rk1', density=False, batched=True,
@@ -298,7 +307,7 @@ class FMRecommender(Recommender):
             params0 = self.model.init(jax.random.key(self.seed), jnp.zeros(2 * X.shape[1] + 1))
             cache = os.path.join('results', f'edlae_lowrank_{X.shape[0]}x{X.shape[1]}_r{self.rank}_'
                                  f"l{self.edlae_params['lmbda']}_p{self.edlae_params['p']}.npz")
-            params0 = ease_params0(params0, X, self.rank, self.keep_prob, self.edlae_params, cache)
+            params0 = ease_params0(params0, X, self.rank, self.keep_prob, self.edlae_params, cache, self.s2_init)
             self.params = params0
             if X_val_in is not None and self.verbose:
                 ndcg0 = evaluate(self, X_val_in, X_val_out, metrics=('ndcg@100',), batch_size=self.score_batch)
