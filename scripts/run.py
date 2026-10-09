@@ -36,6 +36,7 @@ parser.add_argument('--set', nargs='*', default=[], metavar='KEY=VALUE', help='h
 parser.add_argument('--root', default='data')
 parser.add_argument('--out', default='results', help='directory for the json result')
 parser.add_argument('--tag', default='', help='suffix for the result file name')
+parser.add_argument('--save', help='save the trained torch network (state dict) to this path')
 args = parser.parse_args()
 
 params = {**BEST_PARAMS.get(args.model, {}).get(args.dataset, {}), **parse_overrides(args.set)}
@@ -68,4 +69,8 @@ if hasattr(model, 'history'):
 tag = f'_{args.tag}' if args.tag else ''
 path = out / f'{args.model}_{args.dataset}_{args.split}{tag}.json'
 path.write_text(json.dumps(record, indent=2))
+if args.save:
+    import torch
+    torch.save(model.net.state_dict(), args.save)
+    print(f'saved model {args.save}')
 print(f'saved {path}')

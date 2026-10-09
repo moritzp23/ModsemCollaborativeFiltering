@@ -128,3 +128,20 @@ def test_flow_smoke(X):
     import torch
     samples = model.sample(torch.as_tensor(X[:3].toarray()), n_samples=4, n_steps=5)
     assert samples.shape == (4, 3, X.shape[1])
+
+
+def test_calibration_platt_and_ece():
+    from scipy.special import expit
+    from cfrec.calibration import CalibrationAccumulator, fit_platt
+    rng = np.random.default_rng(3)
+    n_users, n_items = 400, 200
+    X_in = sp.csr_matrix((rng.random((n_users, n_items)) < 0.02).astype(np.float32))
+    scores = rng.normal(size=(n_users, n_items))
+    probs = expit(1.5 * scores - 2.0)
+    X_out = sp.csr_matrix(((rng.random((n_users, n_items)) < probs) & (X_in.toarray() == 0)).astype(np.float32))
+    a, b = fit_platt(lambda X: scores[:X.shape[0]] if X.shape[0] == n_users else None, X_in, X_out,
+                     batch_size=n_users)
+    assert abs(a - 1.5) < 0.1 and abs(b + 2.0) < 0.1
+    acc = CalibrationAccumulator(top_k=10)
+    acc.update(probs, X_in, X_out)
+    assert acc.summary()['ece_all'] < 0.01
