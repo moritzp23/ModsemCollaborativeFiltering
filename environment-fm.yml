@@ -1,0 +1,15 @@
+name: cfrec-fm
+# Flow-matching models (cfrec.models.fm) on top of fmbayes (JAX). Separate from `cfrec` (PyTorch, RecVAE):
+# fmbayes needs Python >= 3.13 and jax 0.6.0, and CUDA jax and CUDA torch in one env tend to conflict.
+#   conda env create -f environment-fm.yml
+# Adjust the fmbayes path to your checkout of conditional-flows-UQ.
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - pip
+  - pip:
+      - -e ../conditional-flows-UQ/fmbayes[cuda]
+      - -e .[dev]
+variables:
+  PYTHONNOUSERSITE: "1"   # packages in ~/.local otherwise shadow (and hide missing) env packages

@@ -24,3 +24,9 @@ try:  # optional dependency: pip install -e ".[vae]"
     MODELS['flow'] = FlowMatchingCF
 except ImportError:
     pass
+
+try:  # optional dependency: fmbayes (JAX), see environment-fm.yml
+    from .fm import FMRecommender
+    MODELS['fm'] = FMRecommender
+except ImportError:
+    pass

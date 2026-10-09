@@ -145,3 +145,23 @@ def test_calibration_platt_and_ece():
     acc = CalibrationAccumulator(top_k=10)
     acc.update(probs, X_in, X_out)
     assert acc.summary()['ece_all'] < 0.01
+
+
+@pytest.mark.parametrize('velocity_param', ['affine', 'affine-tgated', 'denoiser-gated', 'gauss-ease'])
+def test_fmbayes_models_smoke(X, velocity_param, tmp_path, monkeypatch):
+    pytest.importorskip('fmbayes')
+    import jax
+    import jax.numpy as jnp
+    from cfrec.models import FMRecommender
+    monkeypatch.chdir(tmp_path)  # gauss-ease caches its EDLAE factors under ./results
+    (tmp_path / 'results').mkdir()
+    m = FMRecommender(velocity_param=velocity_param, hidden_dim=16, rank=8, epochs=1, batch_size=50,
+                      edlae_params={'lmbda': 10., 'p': 0.2}, verbose=False)
+    m.fit(X[:200], X[200:250], X[250:])
+    assert m.score(X[:7]).shape == (7, X.shape[1])
+    assert np.isfinite(m.sample(X[:3], n_samples=2, steps=4)).all()
+    if velocity_param != 'affine':  # time-gated: one-step posterior mean independent of x0
+        y = m._cond(X[:1])[0]
+        x0 = jax.random.normal(jax.random.key(0), y.shape)
+        f = lambda x: x + m.model.apply(m.params, jnp.hstack([x, y, 0.]))
+        assert jnp.allclose(f(x0), f(-x0), atol=1e-4)

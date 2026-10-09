@@ -60,6 +60,17 @@ python scripts/run.py flow ml-20m                       # train (model selection
 python scripts/flow_scoring.py ml-20m                   # posterior mean vs. averaged ODE samples
 ```
 
+The same approach built on `fmbayes` (`conditional-flows-UQ/fmbayes`) (JAX; conditional flow matching for Bayesian
+inverse problems) lives in `models/fm.py`: fmbayes' network registry, training loop (`flows.train.fit`, the
+masking forward operator as its `y_fn`) and ODE transport, plus CF extensions in the same style
+(`denoiser-gated`, `affine-tgated`, `gauss-ease`: fmbayes' Gaussian head with a low-rank EASE mean).
+It needs its own environment (Python >= 3.13, jax 0.6):
+
+```bash
+conda env create -f environment-fm.yml      # env `cfrec-fm`
+python scripts/run.py fm ml-20m --set velocity_param=denoiser-gated
+```
+
 From Python:
 
 ```python
