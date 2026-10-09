@@ -111,10 +111,41 @@ class NNGaussEASE(NNGaussian):
         return self.core(jnp.concatenate([t * xt, l2_rows(y), t], axis=-1))
 
 
+class NNDenoiserEASE(NNDenoiserGated):
+    """`NNDenoiserGated` with a frozen low-rank EASE skip in the logits of the data prediction:
+
+        D = sigmoid(ease_scale * (y U) V^T + obs_logit * y + item_bias + MLP([t x_t, y / |y|, t])).
+
+    The same idea as `NNGaussEASE` (the linear posterior mean as a built-in skip), but trained with the BCE
+    data-prediction loss. y is the raw binary observation. U, V are the EDLAE factors and get no gradient;
+    the MLP is zero-initialised, so training starts at a calibrated EASE prediction (`ease_params0`).
+    Weight decay shrinks U V^T uniformly, which `ease_scale` absorbs.
+    """
+    rank: int = 1000
+    freeze_lowrank: bool = True
+    zero_init_core = True
+
+    def setup(self):
+        NNAffine.setup(self)
+        self.U = self.param('U', nn.initializers.zeros, (self.x_dim, self.rank), self.dtype)
+        self.V = self.param('V', nn.initializers.zeros, (self.x_dim, self.rank), self.dtype)
+        self.ease_scale = self.param('ease_scale', nn.initializers.constant(5.0), (), self.dtype)
+        self.obs_logit = self.param('obs_logit', nn.initializers.constant(10.0), (), self.dtype)
+        self.item_bias = self.param('item_bias', nn.initializers.zeros, (self.x_dim,), self.dtype)
+
+    def denoise_logits(self, inputs):
+        xt, y, t = self._split(inputs)
+        U, V = self.U, self.V
+        if self.freeze_lowrank:
+            U, V = jax.lax.stop_gradient(U), jax.lax.stop_gradient(V)
+        linear = self.ease_scale * ((y @ U) @ V.T) + self.obs_logit * y + self.item_bias
+        return linear + self.core(jnp.concatenate([t * xt, l2_rows(y), t], axis=-1))
+
+
 # registry: fmbayes names plus the CF extensions
 MODEL_MAP = {**fm_models.MODEL_MAP, 'denoiser-gated': NNDenoiserGated, 'affine-tgated': NNAffineTGated,
-             'gauss-ease': NNGaussEASE}
-RAW_Y_MODELS = {'gauss-ease'}       # models that take the binary observation (and normalise internally)
+             'gauss-ease': NNGaussEASE, 'denoiser-ease': NNDenoiserEASE}
+RAW_Y_MODELS = {'gauss-ease', 'denoiser-ease'}       # models that take the binary observation (and normalise internally)
 
 
 def build_model(velocity_param, x_dim, hidden_dim=600, depth=2, activation='swish', **kw):
@@ -194,7 +225,7 @@ def _dense(X: sp.csr_matrix):
 
 def ease_params0(params, X: sp.csr_matrix, rank: int, keep_prob: float, edlae_params: dict,
                  cache: str | None = None, s2_init: str = 'popularity'):
-    """Initial parameters for `NNGaussEASE`: U, V from the rank-`rank` eigen-approximation of EDLAE
+    """Initial parameters for `NNGaussEASE` / `NNDenoiserEASE` (item_bias = logit of the popularity): U, V from the rank-`rank` eigen-approximation of EDLAE
     (`LowRankFactorization(method='eig')`), s^2 from item popularity, mean_scale = 1 / keep_prob (the
     observation keeps only that fraction of the items EDLAE was fitted on). `s2_init='one'` starts s^2 at 1,
     i.e. at fmbayes' affine skip a(t) x_t (no stiffness at t -> 1)."""
@@ -210,11 +241,14 @@ def ease_params0(params, X: sp.csr_matrix, rank: int, keep_prob: float, edlae_pa
         U, V = fac.U.astype(np.float32), fac.V.astype(np.float32)
         if cache:
             np.savez(cache, U=U, V=V)
-    p = np.asarray(X.mean(axis=0)).ravel()
-    log_s2 = (np.zeros_like(p) if s2_init == 'one' else np.log(np.clip(p * (1 - p), 1e-4, 0.25))).astype(np.float32)
+    p = np.clip(np.asarray(X.mean(axis=0)).ravel(), 1e-6, 1 - 1e-6)
     new = dict(params['params'])
-    new.update(U=jnp.asarray(U), V=jnp.asarray(V), log_s2=jnp.asarray(log_s2),
-               mean_scale=jnp.asarray(1.0 / keep_prob, jnp.float32))
+    new.update(U=jnp.asarray(U), V=jnp.asarray(V))
+    if 'log_s2' in new:          # NNGaussEASE
+        log_s2 = np.zeros_like(p) if s2_init == 'one' else np.log(np.clip(p * (1 - p), 1e-4, 0.25))
+        new.update(log_s2=jnp.asarray(log_s2, jnp.float32), mean_scale=jnp.asarray(1.0 / keep_prob, jnp.float32))
+    if 'item_bias' in new:       # NNDenoiserEASE: start at the item popularity
+        new.update(item_bias=jnp.asarray(np.log(p / (1 - p)), jnp.float32))
     return {**params, 'params': new}
 
 
@@ -265,8 +299,11 @@ class FMRecommender(Recommender):
         self.normalise_y = velocity_param not in RAW_Y_MODELS
 
     def build(self, n_items: int):
-        kw = ({'rank': self.rank, 'freeze_lowrank': self.freeze_lowrank}
-              if self.velocity_param == 'gauss-ease' else {})
+        kw = {}
+        if self.velocity_param == 'gauss-ease':
+            kw = {'rank': self.rank, 'freeze_lowrank': self.freeze_lowrank}
+        elif self.velocity_param == 'denoiser-ease':
+            kw = {'rank': self.rank}
         self.model = build_model(self.velocity_param, n_items, self.hidden_dim, self.depth, self.activation, **kw)
         self._apply = jax.jit(jax.vmap(self.model.apply, in_axes=(None, 0)))
         self._transport = make_flow_transport(self.model, method='rk1', density=False, batched=True,
@@ -303,7 +340,7 @@ class FMRecommender(Recommender):
 
         loss_fn = denoiser_bce_loss(self.model) if isinstance(self.model, NNDenoiserGated) else None
         params0 = None
-        if isinstance(self.model, NNGaussEASE):
+        if isinstance(self.model, (NNGaussEASE, NNDenoiserEASE)):
             params0 = self.model.init(jax.random.key(self.seed), jnp.zeros(2 * X.shape[1] + 1))
             cache = os.path.join('results', f'edlae_lowrank_{X.shape[0]}x{X.shape[1]}_r{self.rank}_'
                                  f"l{self.edlae_params['lmbda']}_p{self.edlae_params['p']}.npz")
@@ -311,7 +348,7 @@ class FMRecommender(Recommender):
             self.params = params0
             if X_val_in is not None and self.verbose:
                 ndcg0 = evaluate(self, X_val_in, X_val_out, metrics=('ndcg@100',), batch_size=self.score_batch)
-                print(f"initialisation (low-rank EDLAE mean): val ndcg@100 {ndcg0['ndcg@100']:.4f}", flush=True)
+                print(f"initialisation (low-rank EDLAE skip): val ndcg@100 {ndcg0['ndcg@100']:.4f}", flush=True)
         result = fm_train.fit(self.model, split, self.epochs, batch_size=self.batch_size,
                               learning_rate=self.learning_rate, seed=self.seed, on_epoch=on_epoch,
                               y_fn=y_fn, loss_fn=loss_fn, select='last', optimizer=self.optimizer,

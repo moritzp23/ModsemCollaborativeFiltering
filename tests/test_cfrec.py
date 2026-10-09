@@ -136,7 +136,8 @@ def test_calibration_platt_and_ece():
     assert acc.summary()['ece_all'] < 0.01
 
 
-@pytest.mark.parametrize('velocity_param', ['affine', 'affine-tgated', 'denoiser-gated', 'gauss-ease'])
+@pytest.mark.parametrize('velocity_param', ['affine', 'affine-tgated', 'denoiser-gated', 'gauss-ease',
+                                            'denoiser-ease'])
 def test_fmbayes_models_smoke(X, velocity_param, tmp_path, monkeypatch):
     pytest.importorskip('fmbayes')
     import jax
