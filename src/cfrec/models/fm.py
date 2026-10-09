@@ -225,7 +225,7 @@ def _dense(X: sp.csr_matrix):
 
 def ease_params0(params, X: sp.csr_matrix, rank: int, keep_prob: float, edlae_params: dict,
                  cache: str | None = None, s2_init: str = 'popularity'):
-    """Initial parameters for `NNGaussEASE` / `NNDenoiserEASE` (item_bias = logit of the popularity): U, V from the rank-`rank` eigen-approximation of EDLAE
+    """Initial parameters for `NNGaussEASE` / `NNDenoiserEASE` (constant item_bias): U, V from the rank-`rank` eigen-approximation of EDLAE
     (`LowRankFactorization(method='eig')`), s^2 from item popularity, mean_scale = 1 / keep_prob (the
     observation keeps only that fraction of the items EDLAE was fitted on). `s2_init='one'` starts s^2 at 1,
     i.e. at fmbayes' affine skip a(t) x_t (no stiffness at t -> 1)."""
@@ -247,8 +247,9 @@ def ease_params0(params, X: sp.csr_matrix, rank: int, keep_prob: float, edlae_pa
     if 'log_s2' in new:          # NNGaussEASE
         log_s2 = np.zeros_like(p) if s2_init == 'one' else np.log(np.clip(p * (1 - p), 1e-4, 0.25))
         new.update(log_s2=jnp.asarray(log_s2, jnp.float32), mean_scale=jnp.asarray(1.0 / keep_prob, jnp.float32))
-    if 'item_bias' in new:       # NNDenoiserEASE: start at the item popularity
-        new.update(item_bias=jnp.asarray(np.log(p / (1 - p)), jnp.float32))
+    if 'item_bias' in new:       # NNDenoiserEASE: a constant bias, so the initial ranking is EASE's
+        p_mean = float(p.mean())
+        new.update(item_bias=jnp.full(p.shape, np.log(p_mean / (1 - p_mean)), jnp.float32))
     return {**params, 'params': new}
 
 
