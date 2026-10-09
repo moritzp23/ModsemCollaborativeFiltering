@@ -135,14 +135,18 @@ class FlowMatchingCF(Recommender):
             return (torch.sigmoid(logits) - x1).pow(2).sum(-1).mean()
         raise NotImplementedError(self.loss)
 
+    def build(self, n_items: int):
+        self.n_items = n_items
+        self.net = ConditionalDenoiser(n_items, self.hidden_dim, self.n_blocks, self.input_dropout,
+                                       self.dropout, self.x_gate).to(self.device)
+        return self
+
     def fit(self, X: sp.csr_matrix, X_val_in: sp.csr_matrix | None = None, X_val_out: sp.csr_matrix | None = None):
         from ..evaluation import evaluate
 
         torch.manual_seed(self.seed)
         rng = np.random.default_rng(self.seed)
-        self.n_items = X.shape[1]
-        self.net = ConditionalDenoiser(self.n_items, self.hidden_dim, self.n_blocks, self.input_dropout,
-                                       self.dropout, self.x_gate).to(self.device)
+        self.build(X.shape[1])
         opt = torch.optim.AdamW(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
         best, best_state, self.history = -np.inf, None, []
