@@ -156,12 +156,16 @@ def build_model(velocity_param, x_dim, hidden_dim=600, depth=2, activation='swis
                                      activation=fm_models.ACTIVATIONS[activation], dtype=jnp.float32, **kw)
 
 
-def denoiser_bce_loss(model):
+def denoiser_bce_loss(model, t_sampling: str = 'uniform'):
     """`loss(params, x1, y, key)` for `NNDenoiserGated`: BCE of the data prediction D(x_t, y, t) against x1.
 
     Same sampling of (x0, t) as fmbayes' flow-matching loss; the minimiser is D = E[x1 | x_t, y], i.e.
     the flow-matching velocity through v = (D - x_t)/(1 - t). Summed over items, averaged over the batch.
+    `t_sampling='zero'` trains at t = 0 only: with the time gate the network then sees [0, y, 0], i.e. plain
+    conditional regression of x1 on y without a flow (ablation).
     """
+    if t_sampling not in ('uniform', 'zero'):
+        raise ValueError(f"t_sampling must be 'uniform' or 'zero', got {t_sampling!r}")
     logits_fn = jax.vmap(lambda p, u: model.apply(p, u, method=model.denoise_logits), in_axes=(None, 0))
 
     @jax.jit
@@ -169,7 +173,8 @@ def denoiser_bce_loss(model):
         x0key, tkey = jax.random.split(key)
         n, d = x1.shape
         x0 = draw_reference_jax(shape=(n, d), key=x0key, dtype=x1.dtype)
-        t = jax.random.uniform(tkey, shape=(n, 1), dtype=x1.dtype)
+        t = (jnp.zeros((n, 1), x1.dtype) if t_sampling == 'zero'
+             else jax.random.uniform(tkey, shape=(n, 1), dtype=x1.dtype))
         xt = t * x1 + (1 - t) * x0
         logits = logits_fn(params, jnp.hstack([xt, y, t]))
         bce = jnp.maximum(logits, 0) - logits * x1 + jnp.log1p(jnp.exp(-jnp.abs(logits)))
@@ -266,13 +271,14 @@ class FMRecommender(Recommender):
                     at inference y is used noise-free
     select:         'last' (fmbayes default) or 'ndcg' (best validation NDCG@100, the report's protocol)
     score_samples:  0 = rank by the one-step posterior mean; S > 0 = by the average of S ODE samples
+    t_sampling:     'uniform' (flow matching) or 'zero' (denoiser models only: regression at t = 0, no flow)
     """
 
     def __init__(self, velocity_param='denoiser-gated', hidden_dim=600, depth=2, activation='swish',
                  keep_prob=0.5, flip_prob=0., noise_std=0., epochs=30, batch_size=500, learning_rate=1e-3, optimizer='adamw',
                  weight_decay=0.1, schedule='cosine', select='ndcg', eval_every=1, steps=10, seed=0,
                  score_batch=1000, score_samples=0, rank=1000, edlae_params=None, freeze_lowrank=False,
-                 s2_init='popularity', verbose=True):
+                 s2_init='popularity', t_sampling='uniform', verbose=True):
         self.velocity_param = velocity_param
         self.hidden_dim = hidden_dim
         self.depth = depth
@@ -295,6 +301,7 @@ class FMRecommender(Recommender):
         self.rank = rank
         self.freeze_lowrank = freeze_lowrank
         self.s2_init = s2_init
+        self.t_sampling = t_sampling
         self.edlae_params = edlae_params or {'lmbda': 300, 'p': 0.33}
         self.verbose = verbose
         self.normalise_y = velocity_param not in RAW_Y_MODELS
@@ -339,7 +346,8 @@ class FMRecommender(Recommender):
                 print(f"epoch {epoch} | loss {train_loss:.4f} / val {val_loss:.4f}{ndcg} | "
                       f"{time.perf_counter() - start:.0f}s", flush=True)
 
-        loss_fn = denoiser_bce_loss(self.model) if isinstance(self.model, NNDenoiserGated) else None
+        loss_fn = (denoiser_bce_loss(self.model, self.t_sampling) if isinstance(self.model, NNDenoiserGated)
+                   else None)
         params0 = None
         if isinstance(self.model, (NNGaussEASE, NNDenoiserEASE)):
             params0 = self.model.init(jax.random.key(self.seed), jnp.zeros(2 * X.shape[1] + 1))
