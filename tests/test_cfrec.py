@@ -165,3 +165,22 @@ def test_fmbayes_save_load_roundtrip(X, tmp_path):
     loaded = FMRecommender.load(m.save(str(tmp_path / 'fm.pkl')), verbose=False)
     np.testing.assert_allclose(loaded.score(X[:5]), m.score(X[:5]), rtol=1e-6)
     assert loaded.get_config() == {**m.get_config(), 'verbose': False}
+
+
+def test_joint_scores_detect_dependence():
+    """Items that always co-occur: samples with the right joint beat independent draws with the same marginals."""
+    from cfrec.calibration import JointAccumulator
+    rng = np.random.default_rng(4)
+    n_users, n_items, m = 300, 20, 64
+    X_in = sp.csr_matrix((n_users, n_items), dtype=np.float32)
+    on = rng.random(n_users) < 0.5                     # all-or-nothing users
+    X_out = sp.csr_matrix(np.repeat(on[:, None], n_items, axis=1).astype(np.float32))
+    p = np.full((n_users, n_items), 0.5)
+    joint_true = np.repeat((rng.random((m, n_users)) < 0.5)[:, :, None], n_items, axis=2)
+    indep = rng.random((m, n_users, n_items)) < p
+    acc_true, acc_indep = JointAccumulator(top_k=5), JointAccumulator(top_k=5)
+    acc_true.update(joint_true, p, X_in, X_out)
+    acc_indep.update(indep, p, X_in, X_out)
+    s_true, s_indep = acc_true.summary(), acc_indep.summary()
+    assert s_true['energy'] < s_indep['energy']
+    assert s_true['crps_count'] < s_indep['crps_count']

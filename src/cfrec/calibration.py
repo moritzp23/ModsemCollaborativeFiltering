@@ -130,3 +130,63 @@ def sample_count_coverage(sample_fn: Callable, X_in: sp.csr_matrix, X_out: sp.cs
         lo, hi = np.percentile(counts, [50 - level / 2, 50 + level / 2], axis=1)
         out[f'count_cover{level}_samples'] = float(np.mean((true >= lo) & (true <= hi)))
     return out
+
+
+# --------------------------------------------------------------------------------------------------
+# joint uncertainty: posterior samples vs. independent Bernoulli draws with the same marginals
+# --------------------------------------------------------------------------------------------------
+
+def _crps_samples(samples: np.ndarray, obs: np.ndarray) -> np.ndarray:
+    """CRPS of scalar predictive samples (users, m) against observations (users,): E|X - y| - E|X - X'| / 2."""
+    m = samples.shape[1]
+    s = np.sort(samples, axis=1).astype(np.float64)
+    term1 = np.abs(s - obs[:, None]).mean(axis=1)
+    weights = (2 * np.arange(1, m + 1) - m - 1) / m ** 2       # E|X - X'| = (2/m^2) sum_i (2i - m - 1) x_(i)
+    return term1 - (s * weights).sum(axis=1)
+
+
+def _energy_score(B: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """Energy score of binary sample vectors B (m, users, d) against x (users, d), Euclidean norm:
+    E||B - x|| - E||B - B'|| / 2 (pairs of consecutive samples for the second term)."""
+    d_obs = np.sqrt((B != x[None]).sum(axis=2)).mean(axis=0)
+    d_pair = np.sqrt((B[:-1] != B[1:]).sum(axis=2)).mean(axis=0)
+    return d_obs - d_pair / 2
+
+
+class JointAccumulator:
+    """Joint-uncertainty scores of binary posterior samples on the unobserved items.
+
+    Per user: the number of hidden items N and the number of hits H among the top-`top_k` items (ranked by
+    the marginal probabilities), each scored by CRPS and central-interval coverage; and the energy score
+    of the whole hidden-item vector. Lower CRPS / energy score is better.
+    """
+
+    def __init__(self, top_k: int = 10):
+        self.top_k = top_k
+        self.stats = {k: [] for k in ('crps_count', 'crps_hits', 'energy', 'cover50_count', 'cover90_count',
+                                      'cover50_hits', 'cover90_hits')}
+
+    def update(self, B: np.ndarray, probs: np.ndarray, X_in: sp.csr_matrix, X_out: sp.csr_matrix):
+        """B: binary samples (m, users, items), already zero on observed items."""
+        x = X_out.toarray() > 0
+        unobs = X_in.toarray() == 0
+        top = topk(np.where(unobs, probs, -np.inf), self.top_k)
+        rows = np.arange(len(top))[:, None]
+        for name, pred, obs in (('count', B.sum(axis=2).T, x.sum(axis=1)),
+                                ('hits', B[:, rows, top].sum(axis=2).T, x[rows, top].sum(axis=1))):
+            self.stats[f'crps_{name}'].append(_crps_samples(pred, obs))
+            for level in (50, 90):
+                lo, hi = np.percentile(pred, [50 - level / 2, 50 + level / 2], axis=1)
+                self.stats[f'cover{level}_{name}'].append((obs >= lo) & (obs <= hi))
+        self.stats['energy'].append(_energy_score(B, x & unobs))
+
+    def summary(self) -> dict:
+        return {k: float(np.concatenate(v).mean()) for k, v in self.stats.items()}
+
+
+def sample_diagnostics(S: np.ndarray, probs: np.ndarray, unobs: np.ndarray) -> dict:
+    """Are flow samples (m, users, items) near-binary, and does their mean match the one-step mean?"""
+    vals = S[:, unobs]
+    return {'frac_nonbinary': float(np.mean((vals > 0.1) & (vals < 0.9))),
+            'frac_above_half': float(np.mean(vals > 0.5)),
+            'mean_abs_gap_to_onestep': float(np.abs(S.mean(axis=0)[unobs] - probs[unobs]).mean())}
