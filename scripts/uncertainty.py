@@ -32,6 +32,7 @@ parser.add_argument('--no-samples', nargs='*', default=[], metavar='NAME',
                     help='models scored with independent draws only (e.g. the t = 0 ablation, whose flow is untrained)')
 parser.add_argument('--n-samples', type=int, default=64)
 parser.add_argument('--steps', type=int, nargs='+', default=[10, 20])
+parser.add_argument('--grid', nargs='+', default=['uniform'], choices=['uniform', 'graded'])
 parser.add_argument('--users', type=int, default=None, help='use only the first N test users')
 parser.add_argument('--batch', type=int, default=100)
 parser.add_argument('--seed', type=int, default=0)
@@ -85,8 +86,13 @@ for spec in args.model:
     name, ckpt = spec.split('=')
     model = FMRecommender.load(ckpt, verbose=False)
     res_rank = evaluate(model, X_in, X_out)
+    def sampler(k, g):
+        def f(X):
+            model.grid = g
+            return model.sample(X, args.n_samples, steps=k)
+        return f
     samplers = {} if name in args.no_samples else {
-        f'flow-{k}': (lambda X, k=k: model.sample(X, args.n_samples, steps=k)) for k in args.steps}
+        f'flow-{k}' + ('g' if g == 'graded' else ''): sampler(k, g) for k in args.steps for g in args.grid}
     run(name, model.posterior_mean, samplers)
     results[name]['ranking'] = {m: v for m, v in res_rank.items() if '@' in m}
     print(f"   ranking: " + ', '.join(f'{m} {v:.4f}' for m, v in res_rank.items() if '@' in m and '_se' not in m))

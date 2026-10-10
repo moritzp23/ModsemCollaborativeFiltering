@@ -33,7 +33,7 @@ import numpy as np
 import scipy.sparse as sp
 from fmbayes.flows import models as fm_models
 from fmbayes.flows import train as fm_train
-from fmbayes.flows.integrators import make_flow_transport
+from fmbayes.flows.integrators import graded_grid, make_flow_transport
 from fmbayes.flows.networks import NNAffine, NNGaussian, draw_reference_jax
 
 from .base import Recommender
@@ -162,10 +162,11 @@ def denoiser_bce_loss(model, t_sampling: str = 'uniform'):
     Same sampling of (x0, t) as fmbayes' flow-matching loss; the minimiser is D = E[x1 | x_t, y], i.e.
     the flow-matching velocity through v = (D - x_t)/(1 - t). Summed over items, averaged over the batch.
     `t_sampling='zero'` trains at t = 0 only: with the time gate the network then sees [0, y, 0], i.e. plain
-    conditional regression of x1 on y without a flow (ablation).
+    conditional regression of x1 on y without a flow (ablation). `'late'` draws t = sqrt(u) (density 2t), more
+    weight near t = 1 where the samples are formed.
     """
-    if t_sampling not in ('uniform', 'zero'):
-        raise ValueError(f"t_sampling must be 'uniform' or 'zero', got {t_sampling!r}")
+    if t_sampling not in ('uniform', 'zero', 'late'):
+        raise ValueError(f"t_sampling must be 'uniform', 'zero' or 'late', got {t_sampling!r}")
     logits_fn = jax.vmap(lambda p, u: model.apply(p, u, method=model.denoise_logits), in_axes=(None, 0))
 
     @jax.jit
@@ -173,8 +174,8 @@ def denoiser_bce_loss(model, t_sampling: str = 'uniform'):
         x0key, tkey = jax.random.split(key)
         n, d = x1.shape
         x0 = draw_reference_jax(shape=(n, d), key=x0key, dtype=x1.dtype)
-        t = (jnp.zeros((n, 1), x1.dtype) if t_sampling == 'zero'
-             else jax.random.uniform(tkey, shape=(n, 1), dtype=x1.dtype))
+        u = jax.random.uniform(tkey, shape=(n, 1), dtype=x1.dtype)
+        t = {'zero': jnp.zeros_like(u), 'uniform': u, 'late': jnp.sqrt(u)}[t_sampling]
         xt = t * x1 + (1 - t) * x0
         logits = logits_fn(params, jnp.hstack([xt, y, t]))
         bce = jnp.maximum(logits, 0) - logits * x1 + jnp.log1p(jnp.exp(-jnp.abs(logits)))
@@ -271,14 +272,17 @@ class FMRecommender(Recommender):
                     at inference y is used noise-free
     select:         'last' (fmbayes default) or 'ndcg' (best validation NDCG@100, the report's protocol)
     score_samples:  0 = rank by the one-step posterior mean; S > 0 = by the average of S ODE samples
-    t_sampling:     'uniform' (flow matching) or 'zero' (denoiser models only: regression at t = 0, no flow)
+    t_sampling:     'uniform' (flow matching), 'late' (t = sqrt(u)) or 'zero' (denoiser models only: regression
+                    at t = 0, no flow)
+    t_max:          denoiser models: 1/(1-t) in the velocity is capped at this t
+    grid:           sampling time grid: 'uniform' or 'graded' (fmbayes' graded_grid, steps clustered at t -> 1)
     """
 
     def __init__(self, velocity_param='denoiser-gated', hidden_dim=600, depth=2, activation='swish',
                  keep_prob=0.5, flip_prob=0., noise_std=0., epochs=30, batch_size=500, learning_rate=1e-3, optimizer='adamw',
                  weight_decay=0.1, schedule='cosine', select='ndcg', eval_every=1, steps=10, seed=0,
                  score_batch=1000, score_samples=0, rank=1000, edlae_params=None, freeze_lowrank=False,
-                 s2_init='popularity', t_sampling='uniform', verbose=True):
+                 s2_init='popularity', t_sampling='uniform', t_max=0.99, grid='uniform', verbose=True):
         self.velocity_param = velocity_param
         self.hidden_dim = hidden_dim
         self.depth = depth
@@ -302,6 +306,8 @@ class FMRecommender(Recommender):
         self.freeze_lowrank = freeze_lowrank
         self.s2_init = s2_init
         self.t_sampling = t_sampling
+        self.t_max = t_max
+        self.grid = grid
         self.edlae_params = edlae_params or {'lmbda': 300, 'p': 0.33}
         self.verbose = verbose
         self.normalise_y = velocity_param not in RAW_Y_MODELS
@@ -311,11 +317,14 @@ class FMRecommender(Recommender):
         if self.velocity_param == 'gauss-ease':
             kw = {'rank': self.rank, 'freeze_lowrank': self.freeze_lowrank}
         elif self.velocity_param == 'denoiser-ease':
-            kw = {'rank': self.rank}
+            kw = {'rank': self.rank, 't_max': self.t_max}
+        elif self.velocity_param == 'denoiser-gated':
+            kw = {'t_max': self.t_max}
         self.model = build_model(self.velocity_param, n_items, self.hidden_dim, self.depth, self.activation, **kw)
         self._apply = jax.jit(jax.vmap(self.model.apply, in_axes=(None, 0)))
         self._transport = make_flow_transport(self.model, method='rk1', density=False, batched=True,
                                               from_steps=True)
+        self._transport_grid = make_flow_transport(self.model, method='rk1', density=False, batched=True)
         return self
 
     def fit(self, X: sp.csr_matrix, X_val_in: sp.csr_matrix | None = None, X_val_out: sp.csr_matrix | None = None):
@@ -387,7 +396,11 @@ class FMRecommender(Recommender):
         key = jax.random.key(self.seed) if key is None else key
         yy = jnp.tile(y, (n_samples, 1))
         x0 = jax.random.normal(key, yy.shape, dtype=y.dtype)
-        x1 = self._transport(self.params, x0, yy, steps or self.steps)
+        steps = steps or self.steps
+        if getattr(self, 'grid', 'uniform') == 'graded':
+            x1 = self._transport_grid(self.params, x0, yy, graded_grid(steps, 3.0))
+        else:
+            x1 = self._transport(self.params, x0, yy, steps)
         return np.asarray(x1).reshape(n_samples, *y.shape)
 
     def score(self, X: sp.csr_matrix) -> np.ndarray:
